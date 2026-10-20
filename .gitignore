@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+.env
+storage/
+backups/
+src/generated/
+firebase-service-account*.json
+*.log
+*.tsbuildinfo

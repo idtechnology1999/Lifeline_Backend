@@ -1,0 +1,408 @@
+// Lifeline database (PostgreSQL + PostGIS).
+// Money is stored as Decimal(12,2) naira. Enum-like fields are strings to
+// match the API values exactly (e.g. 'en_route', '24/7').
+
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [postgis]
+}
+
+model User {
+  id              Int       @id @default(autoincrement())
+  name            String
+  phone           String?   @unique
+  email           String?   @unique
+  passwordHash    String?   @map("password_hash")
+  /// requester | provider | admin
+  role            String    @default("requester")
+  /// admins only: super_admin | operations
+  adminRole       String?   @map("admin_role")
+  city            String?
+  /// none | basic | family | annual
+  plan            String    @default("none")
+  walletBalance   Decimal   @default(0) @map("wallet_balance") @db.Decimal(12, 2)
+  /// active | suspended
+  accountStatus   String    @default("active") @map("account_status")
+  phoneVerifiedAt DateTime? @map("phone_verified_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  tokens            AccessToken[]
+  provider          Provider?
+  emergencyRequests EmergencyRequest[]
+  supplyOrders      SupplyOrder[]
+  transactions      Transaction[]
+  walletEntries     WalletEntry[]
+  contacts          EmergencyContact[]
+  addresses         SavedAddress[]
+  notifications     AppNotification[]
+  devices           DeviceToken[]
+  files             StoredFile[]
+
+  @@index([role])
+  @@map("users")
+}
+
+/// Opaque bearer tokens (only the SHA-256 hash is stored), revocable on logout/suspension.
+model AccessToken {
+  id         Int       @id @default(autoincrement())
+  userId     Int       @map("user_id")
+  name       String
+  tokenHash  String    @unique @map("token_hash")
+  lastUsedAt DateTime? @map("last_used_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("access_tokens")
+}
+
+/// Firebase Cloud Messaging tokens for push notifications.
+model DeviceToken {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @map("user_id")
+  token     String   @unique
+  platform  String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("device_tokens")
+}
+
+/// An uploaded file kept on the server's private disk. Only metadata lives here.
+model StoredFile {
+  id           String   @id @default(uuid())
+  ownerId      Int?     @map("owner_id")
+  /// document | product_image | prescription | avatar
+  purpose      String
+  originalName String   @map("original_name")
+  mimeType     String   @map("mime_type")
+  size         Int
+  /// Path relative to the storage root, e.g. documents/12/abc.pdf
+  path         String
+  createdAt    DateTime @default(now()) @map("created_at")
+  owner        User?    @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+
+  documents ProviderDocument[]
+  products  ProductImage[]
+
+  @@map("stored_files")
+}
+
+model Provider {
+  id                Int       @id @default(autoincrement())
+  userId            Int       @unique @map("user_id")
+  /// ambulance | supplier | dispatcher
+  type              String
+  businessName      String    @map("business_name")
+  contactName       String    @map("contact_name")
+  phone             String
+  email             String?
+  city              String?
+  address           String?
+  latitude          Float?
+  longitude         Float?
+  /// PostGIS point kept in sync with latitude/longitude for distance queries
+  location          Unsupported("geography(Point, 4326)")?
+  locationUpdatedAt DateTime? @map("location_updated_at")
+  /// pending | approved | rejected
+  verification      String    @default("pending")
+  rejectionReason   String?   @map("rejection_reason")
+  rating            Decimal   @default(0) @db.Decimal(2, 1)
+  completedJobs     Int       @default(0) @map("completed_jobs")
+  earnings          Decimal   @default(0) @db.Decimal(12, 2)
+  online            Boolean   @default(false)
+  vehicleKind       String?   @map("vehicle_kind")
+  vehiclePlate      String?   @map("vehicle_plate")
+  /// 24/7 | scheduled
+  availability      String    @default("24/7")
+  hoursStart        String?   @map("hours_start")
+  hoursEnd          String?   @map("hours_end")
+  details           Json?
+  submittedAt       DateTime? @map("submitted_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  user           User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documents      ProviderDocument[]
+  products       Product[]
+  withdrawals    Withdrawal[]
+  offers         EmergencyRequestOffer[]
+  assignedTrips  EmergencyRequest[]
+  supplierOrders SupplyOrder[]           @relation("SupplierOrders")
+  deliveries     SupplyOrder[]           @relation("DispatcherOrders")
+  payments       Transaction[]
+
+  @@index([type, verification, online])
+  @@index([location], type: Gist)
+  @@map("providers")
+}
+
+model ProviderDocument {
+  id         Int        @id @default(autoincrement())
+  providerId Int        @map("provider_id")
+  fileId     String     @map("file_id")
+  name       String
+  /// id | license | registration | insurance | photo | other
+  kind       String
+  createdAt  DateTime   @default(now()) @map("created_at")
+  provider   Provider   @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  file       StoredFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@map("provider_documents")
+}
+
+model OtpCode {
+  id         Int       @id @default(autoincrement())
+  phone      String
+  /// login | signup
+  purpose    String
+  codeHash   String    @map("code_hash")
+  attempts   Int       @default(0)
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([phone])
+  @@map("otp_codes")
+}
+
+model EmergencyRequest {
+  id             Int       @id @default(autoincrement())
+  requesterId    Int       @map("requester_id")
+  providerId     Int?      @map("provider_id")
+  /// red | yellow | green | black
+  severity       String
+  /// bls | als | erv
+  ambulanceType  String    @map("ambulance_type")
+  symptoms       Json      @default("[]")
+  notes          String?
+  pickup         String
+  pickupLat      Float?    @map("pickup_lat")
+  pickupLng      Float?    @map("pickup_lng")
+  destination    String
+  destinationLat Float?    @map("destination_lat")
+  destinationLng Float?    @map("destination_lng")
+  /// searching | negotiating | en_route | on_trip | completed | cancelled
+  status         String    @default("searching")
+  estimatedPrice Decimal   @map("estimated_price") @db.Decimal(12, 2)
+  agreedPrice    Decimal?  @map("agreed_price") @db.Decimal(12, 2)
+  etaMinutes     Int?      @map("eta_minutes")
+  paidAt         DateTime? @map("paid_at")
+  completedAt    DateTime? @map("completed_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  requester User                    @relation(fields: [requesterId], references: [id], onDelete: Cascade)
+  provider  Provider?               @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  offers    EmergencyRequestOffer[]
+
+  @@index([status])
+  @@map("emergency_requests")
+}
+
+model EmergencyRequestOffer {
+  id                 Int              @id @default(autoincrement())
+  emergencyRequestId Int              @map("emergency_request_id")
+  providerId         Int              @map("provider_id")
+  amount             Decimal          @db.Decimal(12, 2)
+  /// provider | requester (who made the latest price)
+  lastBy             String           @default("provider") @map("last_by")
+  etaMinutes         Int?             @map("eta_minutes")
+  /// open | accepted | rejected
+  status             String           @default("open")
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+  request            EmergencyRequest @relation(fields: [emergencyRequestId], references: [id], onDelete: Cascade)
+  provider           Provider         @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@unique([emergencyRequestId, providerId])
+  @@map("emergency_request_offers")
+}
+
+model Product {
+  id                   Int            @id @default(autoincrement())
+  supplierId           Int            @map("supplier_id")
+  name                 String
+  category             String
+  description          String?
+  usageNotes           String?        @map("usage_notes")
+  price                Decimal        @db.Decimal(12, 2)
+  stock                Int            @default(0)
+  expiresAt            DateTime?      @map("expires_at") @db.Date
+  available            Boolean        @default(true)
+  requiresPrescription Boolean        @default(false) @map("requires_prescription")
+  emoji                String?
+  createdAt            DateTime       @default(now()) @map("created_at")
+  updatedAt            DateTime       @updatedAt @map("updated_at")
+  supplier             Provider       @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  images               ProductImage[]
+  orderItems           SupplyOrderItem[]
+
+  @@map("products")
+}
+
+model ProductImage {
+  id        Int        @id @default(autoincrement())
+  productId Int        @map("product_id")
+  fileId    String     @map("file_id")
+  position  Int        @default(0)
+  product   Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  file      StoredFile @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@map("product_images")
+}
+
+model SupplyOrder {
+  id              Int       @id @default(autoincrement())
+  requesterId     Int       @map("requester_id")
+  supplierId      Int       @map("supplier_id")
+  dispatcherId    Int?      @map("dispatcher_id")
+  deliveryAddress String    @map("delivery_address")
+  deliveryLat     Float?    @map("delivery_lat")
+  deliveryLng     Float?    @map("delivery_lng")
+  deliveryNote    String?   @map("delivery_note")
+  subtotal        Decimal   @db.Decimal(12, 2)
+  deliveryFee     Decimal   @map("delivery_fee") @db.Decimal(12, 2)
+  total           Decimal   @db.Decimal(12, 2)
+  urgent          Boolean   @default(false)
+  /// pending | accepted | picked_up | delivered | cancelled
+  status          String    @default("pending")
+  paidAt          DateTime? @map("paid_at")
+  deliveredAt     DateTime? @map("delivered_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  requester  User              @relation(fields: [requesterId], references: [id], onDelete: Cascade)
+  supplier   Provider          @relation("SupplierOrders", fields: [supplierId], references: [id], onDelete: Cascade)
+  dispatcher Provider?         @relation("DispatcherOrders", fields: [dispatcherId], references: [id], onDelete: SetNull)
+  items      SupplyOrderItem[]
+
+  @@index([status])
+  @@map("supply_orders")
+}
+
+model SupplyOrderItem {
+  id                   Int         @id @default(autoincrement())
+  supplyOrderId        Int         @map("supply_order_id")
+  productId            Int?        @map("product_id")
+  name                 String
+  qty                  Int
+  price                Decimal     @db.Decimal(12, 2)
+  requiresPrescription Boolean     @default(false) @map("requires_prescription")
+  order                SupplyOrder @relation(fields: [supplyOrderId], references: [id], onDelete: Cascade)
+  product              Product?    @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@map("supply_order_items")
+}
+
+model Transaction {
+  id              Int       @id @default(autoincrement())
+  reference       String    @unique
+  /// ambulance | supplies | subscription
+  kind            String
+  payerId         Int       @map("payer_id")
+  payeeProviderId Int?      @map("payee_provider_id")
+  /// emergency_request | supply_order
+  payableType     String?   @map("payable_type")
+  payableId       Int?      @map("payable_id")
+  amount          Decimal   @db.Decimal(12, 2)
+  commission      Decimal   @default(0) @db.Decimal(12, 2)
+  /// card | transfer | wallet
+  method          String
+  /// successful | pending | failed | refunded
+  status          String    @default("pending")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  payer           User      @relation(fields: [payerId], references: [id], onDelete: Cascade)
+  payee           Provider? @relation(fields: [payeeProviderId], references: [id], onDelete: SetNull)
+
+  @@index([payableType, payableId])
+  @@index([status])
+  @@map("transactions")
+}
+
+model Withdrawal {
+  id            Int      @id @default(autoincrement())
+  providerId    Int      @map("provider_id")
+  amount        Decimal  @db.Decimal(12, 2)
+  bank          String
+  accountName   String   @map("account_name")
+  accountNumber String   @map("account_number")
+  /// pending | paid | declined
+  status        String   @default("pending")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  provider      Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@map("withdrawals")
+}
+
+model WalletEntry {
+  id           Int      @id @default(autoincrement())
+  userId       Int      @map("user_id")
+  /// fund | payment | refund
+  type         String
+  amount       Decimal  @db.Decimal(12, 2)
+  balanceAfter Decimal  @map("balance_after") @db.Decimal(12, 2)
+  description  String
+  method       String?
+  reference    String   @unique
+  createdAt    DateTime @default(now()) @map("created_at")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("wallet_entries")
+}
+
+model EmergencyContact {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @map("user_id")
+  name      String
+  relation  String
+  phone     String
+  createdAt DateTime @default(now()) @map("created_at")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("emergency_contacts")
+}
+
+model SavedAddress {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @map("user_id")
+  label     String?
+  address   String
+  createdAt DateTime @default(now()) @map("created_at")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("saved_addresses")
+}
+
+model AppNotification {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  type      String
+  title     String
+  body      String
+  data      Json?
+  readAt    DateTime? @map("read_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@map("app_notifications")
+}
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}
